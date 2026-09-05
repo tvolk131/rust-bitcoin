@@ -5,6 +5,13 @@
 
 #[cfg(all(feature = "std", target_arch = "x86"))]
 use core::arch::x86::*;
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use core::arch::aarch64::{
+    uint32x4_t, vaddq_u32, vld1q_u32, vld1q_u8, vreinterpretq_u32_u8, vrev32q_u8, vst1q_u32,
+};
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use core::arch::asm;
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 use core::ops::Index;
@@ -94,7 +101,9 @@ impl crate::HashEngine for HashEngine {
 
     const BLOCK_SIZE: usize = 64;
 
-    fn n_bytes_hashed(&self) -> usize { self.length }
+    fn n_bytes_hashed(&self) -> usize {
+        self.length
+    }
 
     engine_input_impl!();
 }
@@ -108,7 +117,9 @@ impl Hash {
     /// Computes hash from `bytes` in `const` context.
     ///
     /// Warning: this function is inefficient. It should be only used in `const` context.
-    pub const fn const_hash(bytes: &[u8]) -> Self { Hash(Midstate::const_hash(bytes, true).0) }
+    pub const fn const_hash(bytes: &[u8]) -> Self {
+        Hash(Midstate::const_hash(bytes, true).0)
+    }
 }
 
 /// Output of the SHA256 hash function.
@@ -123,12 +134,16 @@ impl<I: SliceIndex<[u8]>> Index<I> for Midstate {
     type Output = I::Output;
 
     #[inline]
-    fn index(&self, index: I) -> &Self::Output { &self.0[index] }
+    fn index(&self, index: I) -> &Self::Output {
+        &self.0[index]
+    }
 }
 
 impl str::FromStr for Midstate {
     type Err = hex::HexToArrayError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> { hex::FromHex::from_hex(s) }
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        hex::FromHex::from_hex(s)
+    }
 }
 
 impl Midstate {
@@ -141,7 +156,9 @@ impl Midstate {
     const DISPLAY_BACKWARD: bool = true;
 
     /// Construct a new [`Midstate`] from the inner value.
-    pub const fn from_byte_array(inner: [u8; 32]) -> Self { Midstate(inner) }
+    pub const fn from_byte_array(inner: [u8; 32]) -> Self {
+        Midstate(inner)
+    }
 
     /// Copies a byte slice into the [`Midstate`] object.
     pub fn from_slice(sl: &[u8]) -> Result<Midstate, FromSliceError> {
@@ -155,7 +172,9 @@ impl Midstate {
     }
 
     /// Unwraps the [`Midstate`] and returns the underlying byte array.
-    pub fn to_byte_array(self) -> [u8; 32] { self.0 }
+    pub fn to_byte_array(self) -> [u8; 32] {
+        self.0
+    }
 
     /// Creates midstate for tagged hashes.
     ///
@@ -187,15 +206,27 @@ impl hex::FromHex for Midstate {
 }
 
 #[allow(non_snake_case)]
-const fn Ch(x: u32, y: u32, z: u32) -> u32 { z ^ (x & (y ^ z)) }
+const fn Ch(x: u32, y: u32, z: u32) -> u32 {
+    z ^ (x & (y ^ z))
+}
 #[allow(non_snake_case)]
-const fn Maj(x: u32, y: u32, z: u32) -> u32 { (x & y) | (z & (x | y)) }
+const fn Maj(x: u32, y: u32, z: u32) -> u32 {
+    (x & y) | (z & (x | y))
+}
 #[allow(non_snake_case)]
-const fn Sigma0(x: u32) -> u32 { x.rotate_left(30) ^ x.rotate_left(19) ^ x.rotate_left(10) }
+const fn Sigma0(x: u32) -> u32 {
+    x.rotate_left(30) ^ x.rotate_left(19) ^ x.rotate_left(10)
+}
 #[allow(non_snake_case)]
-const fn Sigma1(x: u32) -> u32 { x.rotate_left(26) ^ x.rotate_left(21) ^ x.rotate_left(7) }
-const fn sigma0(x: u32) -> u32 { x.rotate_left(25) ^ x.rotate_left(14) ^ (x >> 3) }
-const fn sigma1(x: u32) -> u32 { x.rotate_left(15) ^ x.rotate_left(13) ^ (x >> 10) }
+const fn Sigma1(x: u32) -> u32 {
+    x.rotate_left(26) ^ x.rotate_left(21) ^ x.rotate_left(7)
+}
+const fn sigma0(x: u32) -> u32 {
+    x.rotate_left(25) ^ x.rotate_left(14) ^ (x >> 3)
+}
+const fn sigma1(x: u32) -> u32 {
+    x.rotate_left(15) ^ x.rotate_left(13) ^ (x >> 10)
+}
 
 #[cfg(feature = "small-hash")]
 #[macro_use]
@@ -450,6 +481,13 @@ impl HashEngine {
                 && is_x86_feature_detected!("ssse3")
             {
                 return unsafe { self.process_block_simd_x86_intrinsics() };
+            }
+        }
+
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        {
+            if std::arch::is_aarch64_feature_detected!("sha2") {
+                return unsafe { self.process_block_simd_aarch64_intrinsics() };
             }
         }
 
@@ -716,6 +754,90 @@ impl HashEngine {
         _mm_storeu_si128(self.h.as_mut_ptr().add(4) as *mut __m128i, state1);
     }
 
+    /// One SHA-256 block via the ARMv8 SHA2 cryptography extensions,
+    /// mirroring the x86 SHA-NI path above. Round constants as a table for
+    /// the vectorized rounds. Implementation adapted from RustCrypto's
+    /// `sha2` crate (MIT OR Apache-2.0), which adapted it from mbedtls.
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    unsafe fn process_block_simd_aarch64_intrinsics(&mut self) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+
+        let mut abcd = vld1q_u32(self.h[0..4].as_ptr());
+        let mut efgh = vld1q_u32(self.h[4..8].as_ptr());
+        let abcd_orig = abcd;
+        let efgh_orig = efgh;
+
+        // Big-endian message words.
+        let mut s0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(self.buffer[0..16].as_ptr())));
+        let mut s1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(self.buffer[16..32].as_ptr())));
+        let mut s2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(self.buffer[32..48].as_ptr())));
+        let mut s3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(self.buffer[48..64].as_ptr())));
+
+        // Rounds 0 to 15, then the schedule-extended rounds in groups of 16.
+        let mut tmp = vaddq_u32(s0, vld1q_u32(K[0..4].as_ptr()));
+        let mut abcd_prev = abcd;
+        abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+        efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+
+        tmp = vaddq_u32(s1, vld1q_u32(K[4..8].as_ptr()));
+        abcd_prev = abcd;
+        abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+        efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+
+        tmp = vaddq_u32(s2, vld1q_u32(K[8..12].as_ptr()));
+        abcd_prev = abcd;
+        abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+        efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+
+        tmp = vaddq_u32(s3, vld1q_u32(K[12..16].as_ptr()));
+        abcd_prev = abcd;
+        abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+        efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+
+        for t in (16..64).step_by(16) {
+            s0 = vsha256su1q_u32(vsha256su0q_u32(s0, s1), s2, s3);
+            tmp = vaddq_u32(s0, vld1q_u32(K[t..t + 4].as_ptr()));
+            abcd_prev = abcd;
+            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+
+            s1 = vsha256su1q_u32(vsha256su0q_u32(s1, s2), s3, s0);
+            tmp = vaddq_u32(s1, vld1q_u32(K[t + 4..t + 8].as_ptr()));
+            abcd_prev = abcd;
+            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+
+            s2 = vsha256su1q_u32(vsha256su0q_u32(s2, s3), s0, s1);
+            tmp = vaddq_u32(s2, vld1q_u32(K[t + 8..t + 12].as_ptr()));
+            abcd_prev = abcd;
+            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+
+            s3 = vsha256su1q_u32(vsha256su0q_u32(s3, s0), s1, s2);
+            tmp = vaddq_u32(s3, vld1q_u32(K[t + 12..t + 16].as_ptr()));
+            abcd_prev = abcd;
+            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
+            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
+        }
+
+        abcd = vaddq_u32(abcd, abcd_orig);
+        efgh = vaddq_u32(efgh, efgh_orig);
+
+        vst1q_u32(self.h[0..4].as_mut_ptr(), abcd);
+        vst1q_u32(self.h[4..8].as_mut_ptr(), efgh);
+    }
+
     // Algorithm copied from libsecp256k1
     fn software_process_block(&mut self) {
         debug_assert_eq!(self.buffer.len(), BLOCK_SIZE);
@@ -815,8 +937,8 @@ impl HashEngine {
 
 #[cfg(test)]
 mod tests {
-    use crate::{sha256, Hash as _, HashEngine};
     use super::*;
+    use crate::{sha256, Hash as _, HashEngine};
 
     #[test]
     #[cfg(feature = "alloc")]
@@ -1075,3 +1197,99 @@ mod benches {
         bh.bytes = bytes.len() as u64;
     }
 }
+
+// SHA instruction polyfills via inline asm, mirroring RustCrypto's `sha2`
+// crate (the stdarch intrinsics are not stable). aarch64-only, exercised
+// under the runtime detection in `process_block`.
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+mod aarch64_sha2_asm {
+    use super::*;
+
+    #[inline(always)]
+    pub(super) unsafe fn vsha256hq_u32(
+        mut hash_efgh: uint32x4_t,
+        hash_abcd: uint32x4_t,
+        wk: uint32x4_t,
+    ) -> uint32x4_t {
+        asm!(
+            "SHA256H {:q}, {:q}, {:v}.4S",
+            inout(vreg) hash_efgh, in(vreg) hash_abcd, in(vreg) wk,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        hash_efgh
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn vsha256h2q_u32(
+        mut hash_efgh: uint32x4_t,
+        hash_abcd: uint32x4_t,
+        wk: uint32x4_t,
+    ) -> uint32x4_t {
+        asm!(
+            "SHA256H2 {:q}, {:q}, {:v}.4S",
+            inout(vreg) hash_efgh, in(vreg) hash_abcd, in(vreg) wk,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        hash_efgh
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn vsha256su0q_u32(mut w0_3: uint32x4_t, w4_7: uint32x4_t) -> uint32x4_t {
+        asm!(
+            "SHA256SU0 {:v}.4S, {:v}.4S",
+            inout(vreg) w0_3, in(vreg) w4_7,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        w0_3
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn vsha256su1q_u32(
+        mut tw0_3: uint32x4_t,
+        w8_11: uint32x4_t,
+        w12_15: uint32x4_t,
+    ) -> uint32x4_t {
+        asm!(
+            "SHA256SU1 {:v}.4S, {:v}.4S, {:v}.4S",
+            inout(vreg) tw0_3, in(vreg) w8_11, in(vreg) w12_15,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        tw0_3
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[test]
+    fn aarch64_sha2_intrinsics_match_software() {
+        if !std::arch::is_aarch64_feature_detected!("sha2") {
+            return; // no crypto extensions; nothing to compare
+        }
+        // Deterministic pseudorandom blocks (xorshift): the SIMD block
+        // compression must equal the software one, state for state.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for blocks in 1..8u32 {
+            let mut simd_engine = HashEngine::default();
+            let mut soft_engine = HashEngine::default();
+            for _ in 0..blocks {
+                let block: [u8; BLOCK_SIZE] = (0..BLOCK_SIZE)
+                    .map(|_| (next() & 0xff) as u8)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap();
+                simd_engine.buffer = block;
+                soft_engine.buffer = block;
+                unsafe { simd_engine.process_block_simd_aarch64_intrinsics() };
+                soft_engine.software_process_block();
+                assert_eq!(simd_engine.h, soft_engine.h, "mismatch after {blocks} blocks");
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use aarch64_sha2_asm::*;
